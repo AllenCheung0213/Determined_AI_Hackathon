@@ -1,0 +1,7 @@
+determined==0.37.0
+huggingface_hub==0.26.2
+medmnist==3.0.2
+numpy==2.1.3
+scikit_learn==1.5.2
+torch==2.5.1
+torchvision==0.20.1
