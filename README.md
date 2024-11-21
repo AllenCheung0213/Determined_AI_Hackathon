@@ -21,7 +21,16 @@ The objective of this project is to explore active learning techniques for image
 
 ## Dataset
 
-We used the **PathMNIST** dataset from the [MedMNIST dataset collection](https://medmnist.com/). The PathMNIST dataset, part of the MedMNIST collection, serves as a benchmark for evaluating models in medical image classification. It comprises 107,180 images of colorectal cancer histology slides, categorized into nine tissue types. In the original MedMNIST v2 study, baseline models achieved an accuracy of 91.1% on this dataset. 
+We used the **PathMNIST** dataset from the [MedMNIST dataset collection](https://medmnist.com/). The dataset consists of 107,180 images (split into training, validation, and testing subsets), each 28x28 pixels in size, categorized into 9 types of pathological tissues.
+
+### Facts about PathMNIST
+
+- **Data Modality:** Colon Pathology
+- **Task:** Multi-Class (9)
+- **Number of Samples:** 107,180 (89,996 training / 10,004 validation / 7,180 test)
+- **Source Data:**  
+  Jakob Nikolas Kather, Johannes Krisam, et al., "Predicting survival from colorectal cancer histology slides using deep learning: A retrospective multicenter study," PLOS Medicine, vol. 16, no. 1, pp. 1–22, 01 2019.
+- **License:** CC BY 4.0 
 
 ## Sample Data
 
@@ -113,14 +122,16 @@ The model was evaluated on the validation set of PathMNIST using the following m
 - **Validation Loss**: Measures the model's error on the validation dataset.
 - **Accuracy**: Percentage of correctly classified images.
 
-Here is a screenshot of the logs from the DeterminedAI WebUI:
+### Comparison with Benchmark
+In the original MedMNIST v2 study, baseline models achieved an accuracy of 91.1% on the PathMNIST dataset. Our implementation achieved the following results:
 
-![Model Log](images/logs.png)
-
-- **Accuracy (Best):** 94%
+- **Accuracy (Best):** 94.04%
 - **Loss (Best):** 0.1775
 
-Overall, we implemented a ResNet-50-based model with active learning strategies, resulting in a validation accuracy of 94%. This performance surpasses the baseline of 91%, highlighting the effectiveness of our approach in medical image classification tasks.
+This demonstrates a 3% improvement over the baseline accuracy, highlighting the effectiveness of our active learning approach combined with a custom ResNet-50 architecture.
+
+Here is a screenshot of the logs from the DeterminedAI WebUI:
+![Model Log](images/logs.png)
 
 ## License
 
