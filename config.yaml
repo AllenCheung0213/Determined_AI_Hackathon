@@ -1,0 +1,43 @@
+name: medmnist_resnet50_active_learning
+description: "Active learning loop with ResNet-50 on MedMNIST dataset."
+
+hyperparameters:
+  learning_rate:
+    type: double
+    minval: 0.0001
+    maxval: 0.1
+  weight_decay:
+    type: double
+    minval: 0.00001
+    maxval: 0.0005
+  batch_size:
+    type: int
+    minval: 32
+    maxval: 128
+  initial_labeled_size:
+    type: int
+    minval: 3000
+    maxval: 6000
+  mc_dropout_passes:
+    type: int
+    minval: 2
+    maxval: 7
+  samples_to_label:
+    type: int
+    minval: 3000
+    maxval: 4500
+
+entrypoint: python3 model_def.py
+
+checkpoint_storage:
+  type: shared_fs
+  host_path: /home/allen/determined_ai_hackathon/determined_checkpoints
+  storage_path: medmnist_checkpoints
+
+searcher:
+  name: adaptive_asha
+  metric: val_loss
+  smaller_is_better: true
+  max_length:
+    epochs: 20
+  max_trials: 1
