@@ -161,3 +161,4 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 determined_checkpoints/medmnist_checkpoints/5088f8da-1f5a-419e-974c-f9551e57bdcb/
+determined_checkpoints/medmnist_checkpoints/5088f8da-1f5a-419e-974c-f9551e57bdcb/
