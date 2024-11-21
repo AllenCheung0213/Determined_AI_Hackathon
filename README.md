@@ -141,3 +141,5 @@ This project is licensed under the mit License.
 
 - [MedMNIST Dataset](https://medmnist.com/)
 - [Determined AI](https://determined.ai/)
+- **Survey on Deep Active Learning**: Wang, H., Jin, Q., Li, S., Liu, S., Wang, M., & Song, Z. (2024). A comprehensive survey on deep active learning in medical image analysis. *Medical Image Analysis*, 95, 103201. [https://doi.org/10.1016/j.media.2024.103201](https://doi.org/10.1016/j.media.2024.103201)
+
