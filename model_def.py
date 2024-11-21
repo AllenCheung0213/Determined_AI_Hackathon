@@ -1,4 +1,6 @@
 import argparse
+import json
+import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -16,7 +18,8 @@ from sklearn.metrics import pairwise_distances_argmin_min, accuracy_score, roc_a
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
-SAVE_DIRECTORY = "Medmnist_active_learning"
+SAVE_DIRECTORY = "pytorch_model"
+os.makedirs(SAVE_DIRECTORY, exist_ok=True)
 
 class ResNet50_28(nn.Module):
     def __init__(self, num_classes):
@@ -32,6 +35,8 @@ class ResNet50_28(nn.Module):
 def train(args, model, device, train_loader, optimizer, epoch_idx, core_context, steps_completed, scaler):
     model.train()
     all_targets, all_predictions = [], []
+    epoch_loss = 0
+    num_samples = 0
 
     for batch_idx, (data, target) in enumerate(train_loader):
         if data.size(0) == 0:
@@ -41,9 +46,7 @@ def train(args, model, device, train_loader, optimizer, epoch_idx, core_context,
 
         with amp.autocast():
             output = model(data)
-            if target.size(0) != output.size(0):
-                raise ValueError(f"Mismatch: input batch_size ({output.size(0)}) != target batch_size ({target.size(0)})")
-            loss = nn.CrossEntropyLoss()(output, target)
+            loss = nn.CrossEntropyLoss(label_smoothing=0.1)(output, target)
 
         scaler.scale(loss).backward()
         scaler.step(optimizer)
@@ -51,20 +54,22 @@ def train(args, model, device, train_loader, optimizer, epoch_idx, core_context,
 
         steps_completed += 1
 
+        epoch_loss += loss.item() * data.size(0)
+        num_samples += data.size(0)
+        probabilities = torch.softmax(output, dim=1).detach().cpu().numpy()
         all_targets.extend(target.cpu().numpy())
-        all_predictions.extend(output.argmax(dim=1).cpu().numpy())
+        all_predictions.extend(probabilities)
 
-        if (batch_idx + 1) % args.log_interval == 0:
-            accuracy = accuracy_score(all_targets, all_predictions)
-            auc = roc_auc_score(all_targets, all_predictions, multi_class='ovr')
-            logger.info(
-                f"Train Epoch: {epoch_idx} [{batch_idx * len(data)}/{len(train_loader.dataset)}"
-                f" ({100.0 * batch_idx / len(train_loader):.0f}%)]\tLoss: {loss.item():.6f}\tAccuracy: {accuracy:.4f}\tAUC: {auc:.4f}"
-            )
-            core_context.train.report_training_metrics(
-                steps_completed=steps_completed,
-                metrics={"train_loss": loss.item(), "train_accuracy": accuracy, "train_auc": auc},
-            )
+    epoch_loss /= num_samples
+    train_accuracy = accuracy_score(all_targets, np.argmax(all_predictions, axis=1))
+
+    logger.info(
+        f"Train Epoch {epoch_idx} Complete: Loss: {epoch_loss:.4f}, Accuracy: {train_accuracy:.4f}"
+    )
+    core_context.train.report_training_metrics(
+        steps_completed=steps_completed,
+        metrics={"train_loss": epoch_loss, "train_accuracy": train_accuracy},
+    )
     return steps_completed
 
 def test(args, model, device, test_loader, core_context, steps_completed, epochs_completed):
@@ -75,19 +80,17 @@ def test(args, model, device, test_loader, core_context, steps_completed, epochs
     with torch.no_grad():
         for data, target in test_loader:
             data, target = data.to(device), target.to(device).squeeze()
-            with amp.autocast():
-                output = model(data)
-                test_loss += nn.CrossEntropyLoss(reduction="sum")(output, target).item()
+            output = model(data)
+            test_loss += nn.CrossEntropyLoss(reduction="sum")(output, target).item()
+            probabilities = torch.softmax(output, dim=1).detach().cpu().numpy()
             all_targets.extend(target.cpu().numpy())
-            all_predictions.extend(output.argmax(dim=1).cpu().numpy())
+            all_predictions.extend(probabilities)
 
     test_loss /= len(test_loader.dataset)
-    accuracy = accuracy_score(all_targets, all_predictions)
+    accuracy = accuracy_score(all_targets, np.argmax(all_predictions, axis=1))
     auc = roc_auc_score(all_targets, all_predictions, multi_class='ovr')
 
-    logger.info(
-        f"Test set: Average loss: {test_loss:.4f}, Accuracy: {accuracy:.4f}, AUC: {auc:.4f}"
-    )
+    logger.info(f"Test set: Average loss: {test_loss:.4f}, Accuracy: {accuracy:.4f}, AUC: {auc:.4f}")
     core_context.train.report_validation_metrics(
         steps_completed=steps_completed,
         metrics={"test_loss": test_loss, "test_accuracy": accuracy, "test_auc": auc, "epochs": epochs_completed},
@@ -206,13 +209,15 @@ def main(core_context):
 
     if latest_checkpoint is None:
         epochs_completed = 0
+        best_val_loss = float('inf')
     else:
         with core_context.checkpoint.restore_path(latest_checkpoint) as path:
             checkpoint = torch.load(path / "checkpoint.pt")
             model.load_state_dict(checkpoint["model_state_dict"])
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             epochs_completed = checkpoint["epochs_completed"]
-            logger.info(f"Resumed from checkpoint. Epochs completed: {epochs_completed}")
+            best_val_loss = checkpoint.get("best_val_loss", float('inf'))
+            logger.info(f"Resumed from checkpoint. Epochs completed: {epochs_completed}, Best val loss: {best_val_loss:.4f}")
 
     steps_completed = 0
 
@@ -223,7 +228,7 @@ def main(core_context):
             steps_completed = train(args, model, device, train_loader, optimizer, epoch_idx, core_context, steps_completed, scaler)
             val_loss = test(args, model, device, test_loader, core_context, steps_completed, iteration + 1)
             if val_loss is None:
-                val_loss = float("inf")
+                val_loss = float('inf')
             scheduler.step(val_loss)
 
         logger.info("Performing active learning sampling...")
@@ -249,10 +254,10 @@ def main(core_context):
                         "model_state_dict": model.state_dict(),
                         "optimizer_state_dict": optimizer.state_dict(),
                         "epochs_completed": iteration + 1,
+                        "best_val_loss": best_val_loss,
                     },
                     path / "checkpoint.pt",
                 )
-            
             save_model_to_huggingface_format(model, num_classes=9)
             logger.info(f"New best model saved at iteration {iteration + 1} with val_loss {val_loss:.4f}")
 
