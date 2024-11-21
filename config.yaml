@@ -29,10 +29,9 @@ hyperparameters:
 
 entrypoint: python3 model_def.py
 
-checkpoint_storage:
-  type: shared_fs
-  host_path: /home/allen/determined_ai_hackathon/determined_checkpoints
-  storage_path: medmnist_checkpoints
+project: Active_learning
+
+workspace: Determined_AI_Hackathon
 
 searcher:
   name: adaptive_asha
@@ -40,4 +39,4 @@ searcher:
   smaller_is_better: true
   max_length:
     epochs: 20
-  max_trials: 1
+  max_trials: 10

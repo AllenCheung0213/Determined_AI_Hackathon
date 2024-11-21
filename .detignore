@@ -1,0 +1,15 @@
+venv/
+env/
+
+data/
+*.csv
+*.h5
+
+*.pyc
+__pycache__/
+
+*.log
+
+images/
+determined_checkpoints/
+Medmnist_active_learning/

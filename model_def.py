@@ -2,6 +2,7 @@ import argparse
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.cuda.amp as amp
 from torch.optim.lr_scheduler import StepLR
 from torchvision import transforms, models
 from medmnist import PathMNIST
@@ -10,10 +11,12 @@ from torch.utils.data import DataLoader, Subset
 import numpy as np
 import logging
 from sklearn.cluster import MiniBatchKMeans
-from sklearn.metrics import pairwise_distances_argmin_min
+from sklearn.metrics import pairwise_distances_argmin_min, accuracy_score, roc_auc_score
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+SAVE_DIRECTORY = "Medmnist_active_learning"
 
 class ResNet50_28(nn.Module):
     def __init__(self, num_classes):
@@ -26,56 +29,68 @@ class ResNet50_28(nn.Module):
     def forward(self, x):
         return self.model(x)
 
-def train(args, model, device, train_loader, optimizer, epoch_idx, core_context, steps_completed):
+def train(args, model, device, train_loader, optimizer, epoch_idx, core_context, steps_completed, scaler):
     model.train()
+    all_targets, all_predictions = [], []
+
     for batch_idx, (data, target) in enumerate(train_loader):
-        if data.size(0) == 0:  # Skip empty batches
+        if data.size(0) == 0:
             continue
         data, target = data.to(device), target.to(device).squeeze()
         optimizer.zero_grad()
-        output = model(data)
-        if target.size(0) != output.size(0):
-            raise ValueError(f"Mismatch: input batch_size ({output.size(0)}) != target batch_size ({target.size(0)})")
-        loss = nn.CrossEntropyLoss()(output, target)
-        loss.backward()
-        optimizer.step()
+
+        with amp.autocast():
+            output = model(data)
+            if target.size(0) != output.size(0):
+                raise ValueError(f"Mismatch: input batch_size ({output.size(0)}) != target batch_size ({target.size(0)})")
+            loss = nn.CrossEntropyLoss()(output, target)
+
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
         steps_completed += 1
 
+        all_targets.extend(target.cpu().numpy())
+        all_predictions.extend(output.argmax(dim=1).cpu().numpy())
+
         if (batch_idx + 1) % args.log_interval == 0:
+            accuracy = accuracy_score(all_targets, all_predictions)
+            auc = roc_auc_score(all_targets, all_predictions, multi_class='ovr')
             logger.info(
                 f"Train Epoch: {epoch_idx} [{batch_idx * len(data)}/{len(train_loader.dataset)}"
-                f" ({100.0 * batch_idx / len(train_loader):.0f}%)]\tLoss: {loss.item():.6f}"
+                f" ({100.0 * batch_idx / len(train_loader):.0f}%)]\tLoss: {loss.item():.6f}\tAccuracy: {accuracy:.4f}\tAUC: {auc:.4f}"
             )
             core_context.train.report_training_metrics(
                 steps_completed=steps_completed,
-                metrics={"train_loss": loss.item()},
+                metrics={"train_loss": loss.item(), "train_accuracy": accuracy, "train_auc": auc},
             )
     return steps_completed
-
-
 
 def test(args, model, device, test_loader, core_context, steps_completed, epochs_completed):
     model.eval()
     test_loss = 0
-    correct = 0
+    all_targets, all_predictions = [], []
+
     with torch.no_grad():
         for data, target in test_loader:
             data, target = data.to(device), target.to(device).squeeze()
-            output = model(data)
-            test_loss += nn.CrossEntropyLoss(reduction="sum")(output, target).item()
-            pred = output.argmax(dim=1, keepdim=True)
-            correct += pred.eq(target.view_as(pred)).sum().item()
+            with amp.autocast():
+                output = model(data)
+                test_loss += nn.CrossEntropyLoss(reduction="sum")(output, target).item()
+            all_targets.extend(target.cpu().numpy())
+            all_predictions.extend(output.argmax(dim=1).cpu().numpy())
 
     test_loss /= len(test_loader.dataset)
+    accuracy = accuracy_score(all_targets, all_predictions)
+    auc = roc_auc_score(all_targets, all_predictions, multi_class='ovr')
 
     logger.info(
-        f"Test set: Average loss: {test_loss:.4f}, Accuracy: {correct}/{len(test_loader.dataset)}"
-        f" ({100.0 * correct / len(test_loader.dataset):.0f}%)"
+        f"Test set: Average loss: {test_loss:.4f}, Accuracy: {accuracy:.4f}, AUC: {auc:.4f}"
     )
     core_context.train.report_validation_metrics(
         steps_completed=steps_completed,
-        metrics={"test_loss": test_loss, "epochs": epochs_completed},
+        metrics={"test_loss": test_loss, "test_accuracy": accuracy, "test_auc": auc, "epochs": epochs_completed},
     )
     return test_loss
 
@@ -86,9 +101,9 @@ def mixed_sampling_strategy(model, unlabeled_loader, device, num_samples, mc_dro
     with torch.no_grad():
         for batch_idx, (images, _) in enumerate(unlabeled_loader):
             images = images.to(device)
-            mc_outputs = torch.zeros(mc_dropout_passes, images.size(0), 9).to(device)
-            for i in range(mc_dropout_passes):
-                mc_outputs[i] = torch.softmax(model(images), dim=1)
+            mc_outputs = torch.stack([
+                torch.softmax(model(images), dim=1) for _ in range(mc_dropout_passes)
+            ], dim=0)
 
             mean_output = mc_outputs.mean(dim=0)
             entropy = -torch.sum(mean_output * torch.log(mean_output + 1e-6), dim=1)
@@ -101,14 +116,30 @@ def mixed_sampling_strategy(model, unlabeled_loader, device, num_samples, mc_dro
     indices = np.array(indices)
 
     high_uncertainty_indices = np.argsort(-uncertainties)[: num_samples // 2]
-
     kmeans = MiniBatchKMeans(n_clusters=num_samples // 2, random_state=0, batch_size=100).fit(embeddings)
     diverse_indices, _ = pairwise_distances_argmin_min(kmeans.cluster_centers_, embeddings)
 
     selected_indices = np.unique(np.concatenate([high_uncertainty_indices, diverse_indices]))
     return indices[selected_indices]
 
+def save_model_to_huggingface_format(model, num_classes, input_size=(3, 28, 28)):
+    model_save_path = f"{SAVE_DIRECTORY}/pytorch_model.bin"
+    torch.save(model.state_dict(), model_save_path)
+
+    config = {
+        "model_type": "resnet50",
+        "num_classes": num_classes,
+        "input_size": input_size,
+        "architecture": "ResNet50",
+    }
+    config_save_path = f"{SAVE_DIRECTORY}/config.json"
+    with open(config_save_path, "w") as f:
+        json.dump(config, f, indent=4)
+    
+    logger.info(f"Model and configuration saved in Hugging Face format at {SAVE_DIRECTORY}")
+
 def main(core_context):
+    global SAVE_DIRECTORY
     parser = argparse.ArgumentParser(description="Active Learning on MedMNIST")
     parser.add_argument("--batch-size", type=int, default=64, metavar="N", help="Training batch size")
     parser.add_argument("--test-batch-size", type=int, default=1000, metavar="N", help="Testing batch size")
@@ -119,12 +150,15 @@ def main(core_context):
     parser.add_argument("--dry-run", action="store_true", default=False, help="Run a single pass for debugging")
     args = parser.parse_args()
 
+    logger.info("Initializing the experiment...")
     info = det.get_cluster_info()
     assert info is not None, "This script must be run on-cluster with Determined AI"
+    logger.info(f"Running on Determined AI with cluster info: {info}")
+    
     latest_checkpoint = info.latest_checkpoint
 
-    torch.manual_seed(1)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info(f"Using device: {device}")
 
     transform = transforms.Compose([
         transforms.RandomResizedCrop(28, scale=(0.8, 1.0)),
@@ -136,6 +170,8 @@ def main(core_context):
         transforms.ToTensor(),
         transforms.Normalize(mean=[.5], std=[.5])
     ])
+    
+    logger.info("Loading datasets...")
     full_train_dataset = PathMNIST(split="train", transform=transform, download=True)
     val_dataset = PathMNIST(split="val", transform=transform, download=True)
 
@@ -152,9 +188,9 @@ def main(core_context):
     labeled_dataset = Subset(full_train_dataset, labeled_indices)
     unlabeled_dataset = Subset(full_train_dataset, unlabeled_indices)
 
-    train_loader = DataLoader(labeled_dataset, batch_size=args.batch_size, shuffle=True)
-    unlabeled_loader = DataLoader(unlabeled_dataset, batch_size=args.batch_size, shuffle=False)
-    test_loader = DataLoader(val_dataset, batch_size=args.test_batch_size, shuffle=False)
+    train_loader = DataLoader(labeled_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
+    unlabeled_loader = DataLoader(unlabeled_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
+    test_loader = DataLoader(val_dataset, batch_size=args.test_batch_size, shuffle=False, num_workers=4)
 
     model = ResNet50_28(num_classes=9).to(device)
     optimizer = optim.SGD(
@@ -166,6 +202,7 @@ def main(core_context):
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.1, patience=5, verbose=True
     )
+    scaler = amp.GradScaler()
 
     if latest_checkpoint is None:
         epochs_completed = 0
@@ -175,20 +212,21 @@ def main(core_context):
             model.load_state_dict(checkpoint["model_state_dict"])
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             epochs_completed = checkpoint["epochs_completed"]
+            logger.info(f"Resumed from checkpoint. Epochs completed: {epochs_completed}")
 
-    steps_completed = 0 
-    
+    steps_completed = 0
+
     for iteration in range(active_learning_iterations):
-        logger.info(f"Active Learning Iteration {iteration + 1}")
+        logger.info(f"Active Learning Iteration {iteration + 1}/{active_learning_iterations}")
 
         for epoch_idx in range(args.epochs):
-            steps_completed = train(args, model, device, train_loader, optimizer, epoch_idx, core_context, steps_completed)
-            
+            steps_completed = train(args, model, device, train_loader, optimizer, epoch_idx, core_context, steps_completed, scaler)
             val_loss = test(args, model, device, test_loader, core_context, steps_completed, iteration + 1)
-            if val_loss is None:  # Default value if None
+            if val_loss is None:
                 val_loss = float("inf")
             scheduler.step(val_loss)
 
+        logger.info("Performing active learning sampling...")
         selected_indices = mixed_sampling_strategy(model, unlabeled_loader, device, num_active_learning_samples)
 
         labeled_indices.extend(selected_indices)
@@ -197,23 +235,29 @@ def main(core_context):
         labeled_dataset = Subset(full_train_dataset, labeled_indices)
         unlabeled_dataset = Subset(full_train_dataset, unlabeled_indices)
 
-        train_loader = DataLoader(labeled_dataset, batch_size=args.batch_size, shuffle=True)
-        unlabeled_loader = DataLoader(unlabeled_dataset, batch_size=args.batch_size, shuffle=False)
+        train_loader = DataLoader(labeled_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
+        unlabeled_loader = DataLoader(unlabeled_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
 
         logger.info(f"Iteration {iteration + 1}: Labeled samples: {len(labeled_indices)}, Unlabeled samples: {len(unlabeled_indices)}")
 
         checkpoint_metadata_dict = {"epochs_completed": iteration + 1, "steps_completed": steps_completed}
-        with core_context.checkpoint.store_path(checkpoint_metadata_dict) as (path, storage_id):
-            torch.save(
-                {
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "epochs_completed": iteration + 1,
-                },
-                path / "checkpoint.pt",
-            )
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            with core_context.checkpoint.store_path(checkpoint_metadata_dict) as (path, storage_id):
+                torch.save(
+                    {
+                        "model_state_dict": model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "epochs_completed": iteration + 1,
+                    },
+                    path / "checkpoint.pt",
+                )
+            
+            save_model_to_huggingface_format(model, num_classes=9)
+            logger.info(f"New best model saved at iteration {iteration + 1} with val_loss {val_loss:.4f}")
 
         if core_context.preempt.should_preempt():
+            logger.info("Preempting job...")
             return
 
 if __name__ == "__main__":
