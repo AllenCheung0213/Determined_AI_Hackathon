@@ -157,6 +157,10 @@ In the original MedMNIST v2 study, baseline models achieved an accuracy of 91.1%
 
 This demonstrates a 3.6% improvement over the baseline accuracy and 0.6% improvement over the baseline AUC, highlighting the effectiveness of our active learning approach combined with a custom ResNet-50 architecture.
 
+### Best Model Access
+The best model and the Determined AI checkpoint file with the best model can be accessed in the following Hugging Face Repository:
+[Allen Cheung Medmnist Active Learning ](https://huggingface.co/alcheung0213/Medmnist_active_learning)
+
 ## Running Instructions
 
 To train the model, follow these steps:
