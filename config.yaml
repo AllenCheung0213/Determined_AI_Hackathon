@@ -33,6 +33,12 @@ project: Active_learning
 
 workspace: Determined_AI_Hackathon
 
+checkpoint_storage:
+  type: shared_fs
+  host_path: pytorch_model
+  save_trial_best: 1
+  save_trial_latest: 1
+
 resources:
   slots_per_trial: 1
 
@@ -42,4 +48,4 @@ searcher:
   smaller_is_better: true
   max_length:
     epochs: 20
-  max_trials: 1
+  max_trials: 10

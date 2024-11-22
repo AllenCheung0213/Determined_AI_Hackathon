@@ -125,21 +125,26 @@ def mixed_sampling_strategy(model, unlabeled_loader, device, num_samples, mc_dro
     selected_indices = np.unique(np.concatenate([high_uncertainty_indices, diverse_indices]))
     return indices[selected_indices]
 
-def save_model_to_huggingface_format(model, num_classes, input_size=(3, 28, 28)):
-    model_save_path = f"{SAVE_DIRECTORY}/pytorch_model.bin"
-    torch.save(model.state_dict(), model_save_path)
+def save_model_to_huggingface_format(model, num_classes, input_size=(3, 28, 28), save_directory=SAVE_DIRECTORY):
+    """Save the model and configuration in Hugging Face-compatible format."""
+    try:
+        os.makedirs(save_directory, exist_ok=True)
 
-    config = {
-        "model_type": "resnet50",
-        "num_classes": num_classes,
-        "input_size": input_size,
-        "architecture": "ResNet50",
-    }
-    config_save_path = f"{SAVE_DIRECTORY}/config.json"
-    with open(config_save_path, "w") as f:
-        json.dump(config, f, indent=4)
-    
-    logger.info(f"Model and configuration saved in Hugging Face format at {SAVE_DIRECTORY}")
+        model_save_path = os.path.join(save_directory, "pytorch_model.bin")
+        torch.save(model.state_dict(), model_save_path)
+        config = {
+            "model_type": "resnet50",
+            "num_classes": num_classes,
+            "input_size": input_size,
+            "architecture": "ResNet50",
+        }
+        config_save_path = os.path.join(save_directory, "config.json")
+        with open(config_save_path, "w") as f:
+            json.dump(config, f, indent=4)
+
+        logger.info(f"Model and configuration saved in Hugging Face format at {save_directory}")
+    except Exception as e:
+        logger.error(f"Failed to save Hugging Face-compatible model: {e}")
 
 def main(core_context):
     global SAVE_DIRECTORY
@@ -157,11 +162,13 @@ def main(core_context):
     info = det.get_cluster_info()
     assert info is not None, "This script must be run on-cluster with Determined AI"
     logger.info(f"Running on Determined AI with cluster info: {info}")
-    
+
     latest_checkpoint = info.latest_checkpoint
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
+
+    os.makedirs(SAVE_DIRECTORY, exist_ok=True)
 
     transform = transforms.Compose([
         transforms.RandomResizedCrop(28, scale=(0.8, 1.0)),
@@ -256,10 +263,11 @@ def main(core_context):
                         "epochs_completed": iteration + 1,
                         "best_val_loss": best_val_loss,
                     },
-                    path / "checkpoint.pt",
+                    os.path.join(path, "checkpoint.pt"),
                 )
-            save_model_to_huggingface_format(model, num_classes=9)
-            logger.info(f"New best model saved at iteration {iteration + 1} with val_loss {val_loss:.4f}")
+                hf_save_directory = os.path.join(path, "huggingface")
+                save_model_to_huggingface_format(model, num_classes=9, save_directory=hf_save_directory)
+                logger.info(f"Hugging Face-compatible model saved in checkpoint directory: {hf_save_directory}")
 
         if core_context.preempt.should_preempt():
             logger.info("Preempting job...")
